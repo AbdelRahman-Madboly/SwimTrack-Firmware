@@ -1,416 +1,254 @@
-# SwimTrack
+# SwimTrack — ESP32 Swim Training Computer + Flutter App
 
-> ESP32-based wrist-worn swim training computer + Flutter companion app.
+> A wrist-worn swimming tracker that detects strokes, counts laps, calculates SWOLF, stores sessions on flash, and streams live data over WiFi to a companion mobile app.
 
-Detects swim strokes, counts laps, calculates SWOLF efficiency scores, stores sessions on flash memory, and syncs to a phone app over WiFi. Built as a complete hardware + software project: embedded C++ firmware on ESP32 and a Flutter Android app.
+---
+
+## Repositories
+
+| Project | Repository |
+|---------|-----------|
+| **Firmware** (ESP32 / PlatformIO) | https://github.com/AbdelRahman-Madboly/SwimTrack-Firmware.git |
+| **App** (Flutter / Android) | https://github.com/AbdelRahman-Madboly/SwimTrack-app.git |
 
 ---
 
 ## Table of Contents
 
-1. [What Is SwimTrack?](#1-what-is-swimtrack)
-2. [Repository Structure](#2-repository-structure)
-3. [Hardware](#3-hardware)
-4. [Firmware](#4-firmware)
-   - [Build & Flash](#41-build--flash)
-   - [Firmware Architecture](#42-firmware-architecture)
-   - [Build Status](#43-firmware-build-status)
-   - [Serial Commands](#44-serial-commands)
-   - [WiFi REST API](#45-wifi-rest-api)
-   - [Algorithms](#46-algorithms)
-   - [config.h Tuning Reference](#47-configh-tuning-reference)
-   - [Troubleshooting](#48-firmware-troubleshooting)
-   - [Migration to Final Hardware](#49-migration-to-final-hardware)
-5. [Mobile App](#5-mobile-app)
-   - [Tech Stack](#51-tech-stack)
-   - [App Architecture](#52-app-architecture)
-   - [Build & Run](#53-build--run)
-   - [App Build Status](#54-app-build-status)
-   - [Simulator Mode](#55-simulator-mode)
-   - [Connecting to Device](#56-connecting-to-device)
-   - [App Troubleshooting](#57-app-troubleshooting)
-6. [API Reference](#6-api-reference)
-7. [Changelog](#7-changelog)
+1. [System Overview](#1-system-overview)
+2. [Hardware](#2-hardware)
+3. [Firmware — Setup & Build](#3-firmware--setup--build)
+4. [Firmware — How It Works](#4-firmware--how-it-works)
+5. [Firmware — Tuning for Accuracy](#5-firmware--tuning-for-accuracy)
+6. [App — Setup & Build](#6-app--setup--build)
+7. [App — Building the APK](#7-app--building-the-apk)
+8. [App — Adding the App Icon](#8-app--adding-the-app-icon)
+9. [Connecting Device + App](#9-connecting-device--app)
+10. [WiFi REST API Reference](#10-wifi-rest-api-reference)
+11. [Known Limitations & How to Improve](#11-known-limitations--how-to-improve)
+12. [Troubleshooting](#12-troubleshooting)
 
 ---
 
-## 1. What Is SwimTrack?
-
-SwimTrack is a wrist-worn swim training computer that automatically tracks everything about a swim session — no manual lap-counting required. The device detects each stroke using an IMU accelerometer, identifies wall turns using the gyroscope, computes SWOLF scores (lower = better), and stores full session JSON to on-chip flash.
-
-After swimming, connect your phone to the device WiFi network and the app pulls all session data, shows lap-by-lap breakdowns, SWOLF trend charts, and lets you start/stop sessions remotely with live metric monitoring.
-
-**SWOLF** = stroke count + lap time in seconds. A score of 40 means you took 20 strokes in 20 seconds for one lap. Lower SWOLF means better efficiency.
-
----
-
-## 2. Repository Structure
+## 1. System Overview
 
 ```
-SwimTrack/
-├── include/                    Firmware header files (.h)
-│   ├── config.h                All tunable constants — edit here first
-│   ├── mpu6500.h
-│   ├── imu_filters.h
-│   ├── stroke_detector.h
-│   ├── lap_counter.h
-│   ├── session_manager.h
-│   └── wifi_server.h
-│
-├── src/                        Firmware source files (.cpp)
-│   ├── main.cpp                State machine, self-test, button, 50 Hz sample loop
-│   ├── mpu6500.cpp / _part2    I2C driver, burst read, unit conversion
-│   ├── imu_filters.cpp         EMA filter, accel magnitude
-│   ├── stroke_detector.cpp / _part2    Two-state FSM, dynamic baseline, stroke rate
-│   ├── lap_counter.cpp / _part2       Turn FSM, rest detection, variance window
-│   ├── session_manager.cpp / _part2 / _part3   LittleFS, JSON, CRUD
-│   ├── wifi_server.cpp         WiFi AP setup, /api/status handler
-│   ├── wifi_live.cpp           /api/live real-time handler
-│   └── wifi_api.cpp            /api/sessions CRUD + start/stop handlers
-│
-├── Stages/                     Per-prompt isolated test mains (not compiled)
-│   ├── main_p1_imu_test.cpp
-│   ├── main_p2_imu_filters.cpp
-│   └── ...
-│
-├── app/                        Flutter mobile app
-│   ├── lib/
-│   │   ├── main.dart
-│   │   ├── config/             Theme, routes, constants
-│   │   ├── models/             Session, Lap, LiveData, UserProfile, etc.
-│   │   ├── providers/          Riverpod state (device, session, settings, live)
-│   │   ├── services/           WiFi, HTTP, SQLite, sync
-│   │   ├── screens/            Login, profile, home, history, detail, settings
-│   │   └── widgets/            Reusable UI components
-│   ├── android/
-│   └── pubspec.yaml
-│
-├── docs_firmware/              Firmware documentation
-│   ├── README.md               Full firmware technical reference (11 sections)
-│   ├── CHANGELOG.md            Firmware version history
-│   ├── APP_HANDOFF.md          Figma + Flutter setup guide
-│   └── PROGRESS.md             Build progress tracker
-│
-├── platformio.ini              PlatformIO build config
-└── README.md                   This file
+┌────────────────────────────────────────────────────────────┐
+│                  SwimTrack Architecture                    │
+├─────────────────────┬──────────────────────────────────────┤
+│   ESP32 (Firmware)  │   Android Phone (Flutter App)        │
+│                     │                                      │
+│  MPU-6500 IMU       │   Settings tab                       │
+│     ↓ 50 Hz         │     └─ Connect to SwimTrack WiFi     │
+│  EMA Filter         │     └─ Sync sessions                 │
+│     ↓               │                                      │
+│  Stroke Detector    │   Home tab                           │
+│     ↓               │     └─ START SESSION                 │
+│  Lap Counter        │     └─ Live metrics (1 Hz poll)      │
+│     ↓               │     └─ STOP SESSION                  │
+│  Session Manager    │                                      │
+│     ↓ LittleFS      │   History tab                        │
+│  WiFi SoftAP        │     └─ Tap session → detail          │
+│  REST API ──────────┼──→  SWOLF chart, lap table           │
+│  http://192.168.4.1 │                                      │
+└─────────────────────┴──────────────────────────────────────┘
+```
+
+The device runs as a WiFi Access Point (`SwimTrack` / `swim1234`). The phone connects to this network and communicates exclusively over local HTTP — no internet required.
+
+---
+
+## 2. Hardware
+
+| Component | Development Board | Final Hardware |
+|-----------|------------------|----------------|
+| MCU | ESP32 30-pin dev board | LOLIN S2 Mini (ESP32-S2) |
+| IMU | MPU-6050 (GY-521) | MPU-6500 (GY-6500) |
+| I2C SCL | GPIO 22 | GPIO 33 |
+| I2C SDA | GPIO 21 | GPIO 34 |
+| LED | GPIO 2 | GPIO 15 |
+| Button | GPIO 0 (BOOT) | GPIO 0 (BOOT) |
+| WHO\_AM\_I | 0x68 | 0x70 |
+
+**Wiring (LOLIN S2 Mini):**
+
+```
+MPU-6500 VCC → 3.3V
+MPU-6500 GND → GND
+MPU-6500 SCL → GPIO 33
+MPU-6500 SDA → GPIO 34
 ```
 
 ---
 
-## 3. Hardware
+## 3. Firmware — Setup & Build
 
-### Dev / Testing Hardware (current)
+### Prerequisites
 
-| Component | Part | Notes |
-|-----------|------|-------|
-| MCU | ESP32 30-pin dev board (CP2102 USB) | Available on AliExpress |
-| IMU | MPU-6050 GY-521 breakout | AD0 floating → address 0x68 |
-| I2C SCL | GPIO **22** | 4.7 kΩ pull-up to 3.3V recommended |
-| I2C SDA | GPIO **21** | 4.7 kΩ pull-up to 3.3V recommended |
-| LED | GPIO **2** | Built-in on dev board |
-| Button | GPIO **0** | BOOT button (built-in, active LOW) |
+- [PlatformIO](https://platformio.org/) (VS Code extension or CLI)
+- USB cable connected to the ESP32
 
-### Final / Production Hardware (target)
+### Clone & Flash
 
-| Component | Part | Notes |
-|-----------|------|-------|
-| MCU | ESP32-S2 WEMOS S2 Mini | Compact, native USB |
-| IMU | MPU-6500 GY-6500 breakout | AD0 tied GND → address 0x68 |
-| I2C SCL | GPIO **33** | 4.7 kΩ pull-up to 3.3V |
-| I2C SDA | GPIO **34** | 4.7 kΩ pull-up to 3.3V |
-| LED | GPIO **15** | Built-in on WEMOS S2 Mini |
-| Battery | 3.7V LiPo via TP4056 | ~500 mAh recommended |
+```bash
+git clone https://github.com/AbdelRahman-Madboly/SwimTrack-Firmware.git
+cd SwimTrack-Firmware
 
-### Wiring — Dev Kit
+# 1. Upload filesystem (first time only — stores web dashboard)
+pio run --target uploadfs
 
-```
-ESP32 Dev Board          GY-521 (MPU-6050)
-─────────────────        ─────────────────
-3.3V  ────────────────▶  VCC
-GND   ────────────────▶  GND
-GPIO22 ───────────────▶  SCL
-GPIO21 ───────────────▶  SDA
-                         AD0  (leave floating — module has internal pull-down)
+# 2. Flash firmware
+pio run --target upload
+
+# 3. Open serial monitor (115200 baud)
+pio device monitor
 ```
 
-### Chip Differences (MPU-6050 vs MPU-6500)
-
-| Property | MPU-6050 | MPU-6500 |
-|----------|----------|----------|
-| WHO_AM_I | `0x68` | `0x70` |
-| Temp formula | `raw / 340.0 + 36.53` | `raw / 333.87 + 21.0` |
-| Registers / burst read | identical | identical |
-
----
-
-## 4. Firmware
-
-### 4.1 Build & Flash
-
-**Prerequisites:** VS Code + PlatformIO IDE extension.
-
-**`platformio.ini`** (dev kit):
+### platformio.ini (final board)
 
 ```ini
-[env:esp32dev]
-platform = espressif32
-board = esp32dev
-framework = arduino
-lib_deps =
-    bblanchon/ArduinoJson@^7.0.0
+[env:lolin_s2_mini]
+platform    = espressif32
+board       = lolin_s2_mini
+framework   = arduino
+lib_deps    = bblanchon/ArduinoJson@^7.0.0
 board_build.filesystem = littlefs
 monitor_speed = 115200
 ```
 
-**Build and flash commands:**
-
-```bash
-# First time only — upload LittleFS filesystem partition
-pio run --target uploadfs
-
-# Upload firmware
-pio run --target upload
-
-# Open serial monitor
-pio device monitor
-```
-
-For the ESP32-S2 WEMOS S2 Mini, the first flash requires manual boot mode:
-1. Hold **BOOT** (GPIO 0)
-2. Press and release **RESET** while holding BOOT
-3. Release BOOT — board is in download mode
-4. Run `pio run --target upload`
-5. Press RESET after upload to start firmware
-
-### 4.2 Firmware Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        SwimTrack Firmware                        │
-│                                                                  │
-│  ┌──────────┐   raw     ┌────────────┐  filtMag  ┌────────────┐  │
-│  │ MPU-6050 │──samples──▶ imu_filters │──────────▶│  stroke_ │  │
-│  │ /6500    │  (50 Hz)  │  (EMA 0.3) │           │ detector   │  │
-│  └──────────┘           └────────────┘           └─────┬──────┘  │
-│       │                       │ filtMag                │ strokes │
-│       │ gz (dps)              ▼                        ▼         │
-│       │              ┌──────────────┐      ┌─────────────────┐   │
-│       └──────────────▶ lap_counter  │      │ session_manager │  │
-│                      │ turn FSM     │─lap──▶ (LittleFS JSON) │  │
-│                      │ rest detect  │─rest─▶                 │  │
-│                      └──────────────┘      └───────┬─────────┘   │
-│                                                    │             │
-│                      ┌─────────────────────────────▼───────────┐ │
-│                      │             wifi_server                 │ │
-│                      │  GET /api/live   GET /api/sessions      │ │
-│                      │  POST /api/session/start|stop           │ │
-│                      │  GET / (web dashboard)                  │ │
-│                      └─────────────────────────────────────────┘ │
-│                                                                  │
-│  main.cpp — State Machine                                        │
-│  IDLE ──(btn/API)──▶ RECORDING ──(btn/API)──▶ IDLE              │
-│  IDLE ──(5 min, no WiFi client)──▶ SLEEPING ──(btn)──▶ IDLE     │
-└──────────────────────────────────────────────────────────────────┘
-
-Phone ◀──── WiFi SoftAP 192.168.4.1 ────▶ REST API + Web Dashboard
-```
-
-| Module | Files | Responsibility |
-|--------|-------|----------------|
-| IMU Driver | `mpu6500.h/.cpp/_part2` | I2C init, 14-byte burst read, unit conversion |
-| IMU Filters | `imu_filters.h/.cpp` | EMA filter, accel magnitude |
-| Stroke Detector | `stroke_detector.h/.cpp/_part2` | Two-state FSM, dynamic baseline, stroke rate |
-| Lap Counter | `lap_counter.h/.cpp/_part2` | Turn FSM, rest detection, variance window |
-| Session Manager | `session_manager.h/.cpp/_part2/_part3` | LittleFS mount, JSON serialisation, CRUD |
-| WiFi Server | `wifi_server.h`, `wifi_server.cpp`, `wifi_live.cpp`, `wifi_api.cpp` | SoftAP, REST API, dashboard |
-| Main | `main.cpp` | State machine, self-test, button, sample loop |
-
-### 4.3 Firmware Build Status
-
-| # | Module | Status | Confirmed Output |
-|---|--------|--------|-----------------|
-| 1 | IMU Driver | ✅ PASSED | `WHO_AM_I=0x68`, 50.00 Hz confirmed |
-| 2 | IMU Filters | ✅ PASSED | Serial Plotter: raw / filtered clean |
-| 3 | Stroke Detector | ✅ PASSED | Manual count matches ±1 over 10 strokes |
-| 4 | Lap Counter + Rest Detection | ✅ PASSED | Turn + rest confirmed |
-| 5 | Session Manager + LittleFS | ✅ PASSED | JSON saved / listed / printed / deleted |
-| 6 | WiFi SoftAP + REST API | ✅ PASSED | All endpoints, `clients=1` confirmed |
-| 7 | Web Dashboard | ✅ PASSED | Live tiles + start/stop on phone browser |
-| 8 | Power Manager | ⏭ SKIPPED | Deferred to ESP32-S2 hardware build |
-| 9 | Full Integration + State Machine | ✅ PASSED | Self-test, button, states, 50 Hz stable |
-| 10 | Documentation | ✅ COMPLETE | `docs_firmware/README.md` + `CHANGELOG.md` |
-
-### 4.4 Serial Commands
-
-Connect at **115200 baud** (`pio device monitor`).
+### Serial Commands
 
 | Key | Action |
 |-----|--------|
 | `s` | Start session |
-| `x` | Stop + save session to flash |
+| `x` | Stop + save session |
 | `l` | List all saved sessions |
 | `p` | Print last session JSON |
 | `d` | Delete last session |
-| `r` | Reset all counters |
-| `f` | Filesystem info (used / total flash) |
+| `r` | Reset stroke/lap counters |
+| `f` | Filesystem info |
 | `i` | Print live stats |
 
-**Button (GPIO 0):** Short press = start/stop session · Long press 3s = full reset
+**Button (GPIO 0):** Short press = start/stop session · Long press 3 s = full reset
 
-**LED patterns:** 2 slow blinks on boot = self-test pass · Rapid blink = fatal error + halt · 2ms flash = stroke detected · 200ms flash = lap confirmed
-
-### 4.5 WiFi REST API
-
-Connect phone to **SwimTrack** / `swim1234` → open `http://192.168.4.1`
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | Web dashboard |
-| GET | `/api/status` | Device mode, battery, uptime, heap |
-| GET | `/api/live` | Real-time IMU + stroke/lap metrics |
-| GET | `/api/sessions` | Summary list of all saved sessions |
-| GET | `/api/sessions/<id>` | Full session JSON with lap data |
-| POST | `/api/session/start` | Body: `{"pool_length_m":25}` |
-| POST | `/api/session/stop` | Save and close active session |
-| POST | `/api/config` | Update pool length |
-| DELETE | `/api/sessions/<id>` | Delete session from flash |
-
-> **Note on float fields:** Several fields in `/api/live` and session JSON are returned as strings (e.g. `"rate_spm": "32.5"`) due to `serialized(String(value, 1))` in the ArduinoJson firmware code. The app parses these with `double.tryParse(v.toString())`.
-
-> **Note on session IDs:** The `id` returned from `/api/session/start` is `millis()` at start time (a temporary handle). The `saved_id` from `/api/session/stop` is the permanent LittleFS numeric ID — always use `saved_id` for subsequent `GET /api/sessions/<id>` calls.
-
-### 4.6 Algorithms
-
-**Stroke detection**
-Filtered accel magnitude (EMA α=0.3) is compared against a dynamic baseline tracked by a slow EMA (α=0.02). A stroke is counted on the falling edge after magnitude exceeds `baseline + 0.4g`. A 500ms minimum gap prevents double-counting.
-
-**Lap / turn detection**
-Three-state FSM: IDLE → SPIKE (gyro Z > 150 dps for ≥30ms) → GLIDE_WAIT (filtered magnitude < 1.2g for ≥100ms within a 2-second window) → LAP CONFIRMED. A 5-second minimum lap duration (15s for pool use) prevents false triggers.
-
-**Rest detection**
-Rolling 1-second variance of filtered magnitude. Variance < 0.05 g² sustained for 5+ seconds → resting state. One-shot `restJustStarted()` / `restJustEnded()` pulse flags are set on transitions.
-
-**SWOLF**
-`swolf = stroke_count + lap_duration_seconds`. Lower is better.
-
-### 4.7 config.h Tuning Reference
-
-All algorithm constants live in `include/config.h`. Change these for pool vs. bench testing:
-
-| Constant | Bench | Pool | Description |
-|----------|-------|------|-------------|
-| `LAP_MIN_DURATION_MS` | `5000` | **`15000`** | ⚠️ **Change before pool use** |
-| `STROKE_THRESHOLD_G` | `0.4` | tune | g above baseline to count a stroke |
-| `STROKE_MIN_GAP_MS` | `500` | tune | minimum ms between strokes |
-| `TURN_GYRO_Z_THRESH_DPS` | `150` | tune | gyro Z spike threshold for turn |
-| `REST_VARIANCE_THRESH` | `0.05` | tune | g² variance threshold for rest |
-| `GLIDE_ACCEL_THRESH_G` | `1.2` | tune | max accel during glide phase |
-
-### 4.8 Firmware Troubleshooting
-
-| Symptom | Likely Cause | Fix |
-|---------|-------------|-----|
-| `WHO_AM_I = 0x00` | I2C not responding | Check SDA/SCL not swapped, VCC=3.3V, GND connected |
-| `WHO_AM_I mismatch` | Wrong chip detected | Set `MPU_WHO_AM_I_VAL` to `0x68` (MPU-6050) or `0x70` (MPU-6500) in `config.h` |
-| No strokes detected | Threshold too high | Lower `STROKE_THRESHOLD_G` to `0.25`, or raise `EMA_ALPHA` to `0.4` |
-| Strokes double-counted | Gap too short | Raise `STROKE_MIN_GAP_MS` to `600` or `700` |
-| Lap fires during arm motion | Gyro threshold too low | Raise `TURN_GYRO_Z_THRESH_DPS` to `180–200` |
-| LittleFS mount failed | Wrong partition scheme | Add `board_build.filesystem = littlefs` and run `pio run --target uploadfs` |
-| WiFi not visible on phone | Boot not complete | Wait 3s; verify `[WIFI] AP started` in Serial Monitor |
-| Sporadic `I2C Error 263` | Loose wire | Shorten and secure I2C wires; add 4.7 kΩ pull-ups |
-
-### 4.9 Migration to Final Hardware
-
-Five changes total — everything else is identical.
-
-**`include/config.h`** — 3 changes:
-
-```diff
-- #define PIN_I2C_SCL       22
-+ #define PIN_I2C_SCL       33
-
-- #define PIN_I2C_SDA       21
-+ #define PIN_I2C_SDA       34
-
-- #define MPU_WHO_AM_I_VAL  0x68
-+ #define MPU_WHO_AM_I_VAL  0x70
-
-- #define PIN_LED            2
-+ #define PIN_LED           15
-```
-
-**`src/mpu6500.cpp`** — temperature formula in `read()`:
-
-```diff
-- sample.temp_c = static_cast<float>(rawTemp) / 340.0f + 36.53f;
-+ sample.temp_c = static_cast<float>(rawTemp) / 333.87f + 21.0f;
-```
-
-**`platformio.ini`**:
-
-```diff
-- board = esp32dev
-+ board = wemos_s2_mini
-```
+**LED:** 2 slow blinks = boot OK · Rapid = fatal error · 2 ms flash = stroke · 200 ms flash = lap
 
 ---
 
-## 5. Mobile App
+## 4. Firmware — How It Works
 
-Flutter companion app (Android). Communicates with the device over the local WiFi network — no internet required. Also works in **simulator mode** with no hardware at all.
-
-### 5.1 Tech Stack
-
-| Library | Version | Purpose |
-|---------|---------|---------|
-| `flutter_riverpod` | ^2.4.0 | State management |
-| `go_router` | ^13.0.0 | Navigation |
-| `dio` | ^5.4.0 | HTTP client |
-| `wifi_iot` | ^0.3.19 | WiFi connection |
-| `sqflite` | ^2.3.0 | Local SQLite session storage |
-| `shared_preferences` | ^2.2.0 | User profile persistence |
-| `fl_chart` | ^0.66.0 | SWOLF trend, lap charts |
-| `google_fonts` | ^6.1.0 | Poppins + Inter fonts |
-| `intl` | ^0.19.0 | Date formatting |
-| `wakelock_plus` | ^1.1.0 | Screen-on during live session |
-
-### 5.2 App Architecture
+### File Structure
 
 ```
-Screens
-  Login ──▶ Profile Setup ──▶ Main Shell
-                                 ├── Home Tab      (live session, start/stop)
-                                 ├── History Tab   (session list → detail)
-                                 └── Settings Tab  (profile, device, sync)
-
-Providers (Riverpod)
-  DeviceProvider    connection state machine (disconnected / connecting / connected / error)
-  LiveProvider      StreamProvider polling /api/live every 1s during recording
-  SessionProvider   loads from SQLite, exposes session list
-  SettingsProvider  pool length, simulator mode toggle
-
-Services
-  DeviceApiService  all HTTP calls; returns mock data in simulator mode
-  WiFiService       wifi_iot connect/disconnect wrapper
-  SyncService       pulls device sessions → compares with local → inserts new
-  DatabaseService   SQLite sessions / laps / rests tables
-
-Design System
-  SwimTrackColors   primary #0077B6 · secondary #00B4D8 · background #F8FAFE
-  SwimTrackTextStyles   Poppins for numbers/headings · Inter for body/labels
+SwimTrack-Firmware/
+├── include/
+│   ├── config.h          ← All tuning constants (edit this to tune)
+│   ├── mpu6500.h         ← IMU driver interface
+│   ├── imu_filters.h     ← EMA filter
+│   ├── stroke_detector.h ← Stroke FSM
+│   ├── lap_counter.h     ← Turn + rest detection
+│   ├── session_manager.h ← LittleFS session storage
+│   └── wifi_server.h     ← HTTP server + API routes
+└── src/
+    ├── main.cpp               ← State machine, 50 Hz loop
+    ├── mpu6500.cpp/.._part2   ← I2C read, calibration
+    ├── imu_filters.cpp        ← EMA implementation
+    ├── stroke_detector.cpp/..2← Two-state stroke FSM
+    ├── lap_counter.cpp/..2    ← Turn FSM, rest detection
+    ├── session_manager.cpp/..3← JSON build + LittleFS CRUD
+    ├── wifi_server.cpp        ← SoftAP + route registration
+    ├── wifi_live.cpp          ← GET /api/live handler
+    └── wifi_api.cpp           ← All other API handlers
 ```
 
-### 5.3 Build & Run
+### Algorithm Pipeline
 
-**Prerequisites:** Flutter SDK ≥3.0, Android Studio or VS Code with Flutter plugin, Android device or emulator (API 21+).
+**1. IMU Sampling (50 Hz)**
+Raw accel + gyro read from MPU-6500 over I2C. EMA filter with α = 0.3 smooths noise.
+
+**2. Stroke Detection**
+Two-state FSM on EMA-filtered acceleration magnitude:
+- State IDLE → STROKE when magnitude exceeds `baseline + STROKE_THRESHOLD_G (0.4g)`
+- Counted on falling edge back to IDLE
+- Minimum gap between strokes: `STROKE_MIN_GAP_MS (500 ms)` — prevents double-count
+
+**3. Lap / Turn Detection**
+Monitors gyro Z axis for wall-turn signature:
+- Spike > `TURN_GYRO_Z_THRESH_DPS (150 °/s)` for minimum `TURN_SPIKE_MIN_MS`
+- Followed by glide period > `TURN_GLIDE_MIN_MS (200 ms)` with low accel
+- Lap counted only if elapsed since last lap > `LAP_MIN_DURATION_MS (5000 ms)`
+
+**4. Rest Detection**
+Tracks rolling variance of accel magnitude over a 2 s window:
+- Variance < `REST_VARIANCE_THRESH (0.05)` for `REST_DURATION_MS (5000 ms)` → rest declared
+- Variance rising → rest ends, new lap segment begins
+
+**5. Session Storage**
+Sessions serialised to JSON and written to LittleFS (4 MB flash partition).
+Up to 80 laps and 20 rest intervals per session.
+
+---
+
+## 5. Firmware — Tuning for Accuracy
+
+All tuning constants are in `include/config.h`. **Edit this file to improve detection accuracy.**
+
+### Stroke Detection
+
+| Constant | Default | When to Change |
+|----------|---------|----------------|
+| `STROKE_THRESHOLD_G` | `0.4f` | Increase if getting phantom strokes at rest; decrease if missing strokes |
+| `STROKE_MIN_GAP_MS` | `500` | Increase for slower swimmers; decrease for sprinters |
+| `EMA_ALPHA` | `0.3f` | Decrease (e.g. 0.15) for more smoothing; increase for faster response |
+
+**If the app shows strokes when not moving:**
+Increase `STROKE_THRESHOLD_G` to `0.6` or `0.8`. The device is picking up motion noise at rest.
+
+**If strokes are being missed:**
+Decrease `STROKE_THRESHOLD_G` to `0.25`. Check that the wrist-band holds the device snugly — loose mounting causes weak peaks.
+
+### Lap Detection
+
+| Constant | Default | When to Change |
+|----------|---------|----------------|
+| `TURN_GYRO_Z_THRESH_DPS` | `150.0f` | Decrease if turns not detected; increase if false laps appear |
+| `LAP_MIN_DURATION_MS` | `5000` | Must be < minimum possible lap time. Increase for casual swimmers |
+| `TURN_GLIDE_WINDOW_MS` | `2000` | Increase for swimmers with longer push-off glide |
+| `GLIDE_ACCEL_THRESH_G` | `1.2f` | Threshold during glide to confirm turn — usually fine as-is |
+
+**For bench testing (short fake laps):**
+Temporarily set `LAP_MIN_DURATION_MS` to `2000` to allow quick test laps.
+**Reset to `5000`+ before pool use.**
+
+### Rest Detection
+
+| Constant | Default | When to Change |
+|----------|---------|----------------|
+| `REST_VARIANCE_THRESH` | `0.05f` | Increase if rests not detected; decrease if activity triggers rest |
+| `REST_DURATION_MS` | `5000` | Decrease for interval training with short rests |
+
+---
+
+## 6. App — Setup & Build
+
+### Prerequisites
+
+- Flutter SDK ≥ 3.0.0 ([install](https://docs.flutter.dev/get-started/install))
+- Android Studio or VS Code with Flutter extension
+- Android device (physical recommended) or emulator
+
+### Clone & Run
 
 ```bash
-cd C:\Dan_WS\SwimTrack\app
+git clone https://github.com/AbdelRahman-Madboly/SwimTrack-app.git
+cd SwimTrack-app
 flutter pub get
 flutter run
 ```
 
-**Required Android permissions** in `android/app/src/main/AndroidManifest.xml`:
+### Android Permissions
+
+Ensure `android/app/src/main/AndroidManifest.xml` has these inside `<manifest>`:
 
 ```xml
 <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
@@ -422,71 +260,177 @@ flutter run
 <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
 ```
 
-Also add to the `<application>` tag (required for plain HTTP to the device):
+And inside the `<application>` tag:
 
 ```xml
 android:usesCleartextTraffic="true"
 ```
 
-**Build release APK:**
+> This is required because the ESP32 serves plain HTTP (not HTTPS).
 
-```bash
-flutter build apk --release
-# Output: build/app/outputs/flutter-apk/app-release.apk
+### App File Structure
+
+```
+lib/
+├── config/
+│   ├── constants.dart      ← API base URL, prefs keys, defaults
+│   ├── routes.dart         ← GoRouter setup + auth redirect
+│   └── theme.dart          ← Colors, text styles
+├── models/
+│   ├── device_status.dart  ← DeviceStatus.fromJson()
+│   ├── live_data.dart      ← LiveData.fromJson() — handles float-as-string
+│   ├── session.dart        ← Session + Lap + RestInterval models
+│   └── user_profile.dart   ← Swimmer profile
+├── providers/
+│   ├── device_provider.dart   ← Connection state machine
+│   ├── live_provider.dart     ← StreamProvider — 1 Hz poll of /api/live
+│   ├── session_provider.dart  ← SQLite session CRUD + sync
+│   ├── profile_provider.dart  ← SharedPreferences user profile
+│   └── settings_provider.dart ← Pool length + simulator toggle
+├── screens/
+│   ├── login_screen.dart
+│   ├── profile_setup_screen.dart
+│   ├── main_screen.dart         ← 3-tab shell
+│   ├── home_tab.dart            ← Idle + recording states
+│   ├── history_tab.dart
+│   ├── session_detail_screen.dart
+│   └── settings_tab.dart
+├── services/
+│   ├── device_api_service.dart  ← All HTTP calls to ESP32
+│   ├── database_service.dart    ← SQLite via sqflite
+│   ├── mock_data_service.dart   ← Fake data for simulator mode
+│   ├── sync_service.dart        ← Device → local sync logic
+│   └── wifi_service.dart        ← WiFi connect/disconnect
+├── widgets/                     ← Reusable UI components
+└── main.dart                    ← Entry point, simulator sync
 ```
 
-### 5.4 App Build Status
+### Simulator Mode
 
-| # | Module | Status |
-|---|--------|--------|
-| 1 | Project Setup + Theme + Mock Data | ✅ |
-| 2 | Database Service + Session Provider | ✅ |
-| 3 | Dashboard Screen | ✅ |
-| 4 | Session History + Detail Screens | ✅ |
-| 5 | Progress Screen | ✅ |
-| 6 | Device API + WiFi Service | ✅ |
-| 7 | Settings + Connection Flow | ✅ |
-| 8 | Sync Service | ✅ |
-| 9 | Live Session Screen | ✅ |
-| 10 | Start Session Flow | ✅ |
-| 11 | Polish + Error Handling | ✅ |
-| 12 | Documentation | ✅ |
+The app has a built-in **Simulator Mode** (Settings → APP section → toggle).
 
-### 5.5 Simulator Mode
+When ON:
+- No physical device or WiFi needed
+- All API calls return realistic mock data instantly
+- Full app flow works: connect → sync → start session → live metrics → stop → history
 
-Enable **Simulator Mode** in the Settings tab. All API calls are replaced by `MockDataService` — the app generates realistic fake sessions, live data, and sync results with no ESP32 required.
+**This is for testing and development only.** When connecting to the real device, ensure **Simulator Mode is OFF**.
 
-Use simulator mode to develop and test the full app UI on any Android device or emulator, independent of hardware availability.
-
-### 5.6 Connecting to Device
-
-1. Flash SwimTrack firmware to the ESP32 (Prompt 9 `main.cpp`)
-2. Power on the ESP32
-3. On your Android phone: **Settings → WiFi → SwimTrack** (password: `swim1234`)
-4. Open the SwimTrack app
-5. Login screen: tap **Connect**
-6. Settings tab → tap **Sync Sessions** to pull saved sessions from device
-7. Home tab → tap **START SESSION** → swim → tap **STOP SESSION**
-
-The entire system operates on the local WiFi network — no internet or cloud required.
-
-### 5.7 App Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| All API calls fail | `usesCleartextTraffic` missing | Add `android:usesCleartextTraffic="true"` to `<application>` in AndroidManifest.xml |
-| WiFi permission denied | Android permissions missing | Add all WiFi permissions listed in §5.3 |
-| Google Fonts not loading | No internet on first launch | Connect phone to internet once, then fonts cache |
-| sqflite crash | Running on iOS simulator | Use a physical Android device |
-| Connection refused | Device not powered on or out of range | Verify ESP32 is on; Serial Monitor should show `[WIFI] AP started` |
-| Sync shows 0 new sessions | Never synced, or sessions already local | Power on device, connect to WiFi, then tap Sync |
+> **Important fix in `main.dart`:** The app pre-loads the simulator mode preference on startup so `DeviceApiService` is correctly configured before any provider initialises. Without this, the service could use real HTTP calls even while the provider shows simulator mode.
 
 ---
 
-## 6. API Reference
+## 7. App — Building the APK
 
-Full base URL: `http://192.168.4.1`  
-All responses: `Content-Type: application/json`
+### Release APK (for distribution)
+
+```bash
+cd SwimTrack-app
+
+# Clean build (recommended)
+flutter clean
+flutter pub get
+
+# Build release APK
+flutter build apk --release
+
+# Output location:
+# build/app/outputs/flutter-apk/app-release.apk
+```
+
+Install directly on an Android phone:
+
+```bash
+flutter install
+# or copy the APK to the phone and open it
+# (Allow installation from unknown sources if prompted)
+```
+
+### Split APKs by architecture (smaller file size)
+
+```bash
+flutter build apk --split-per-abi --release
+# Creates separate APKs for arm64-v8a, armeabi-v7a, x86_64
+# Use arm64-v8a for most modern Android phones
+```
+
+### App Bundle (for Google Play Store)
+
+```bash
+flutter build appbundle --release
+# Output: build/app/outputs/bundle/release/app-release.aab
+```
+
+---
+
+## 8. App — Adding the App Icon
+
+### Quick Setup
+
+1. Create the directory `assets/icon/` in the project root
+2. Place your icon PNG (1024×1024, square, no transparency for background) at:
+   - `assets/icon/app_icon.png` — full icon with background
+   - `assets/icon/app_icon_foreground.png` — foreground only (transparent bg) for Android adaptive icons
+
+3. Add `flutter_launcher_icons` to `pubspec.yaml` dev dependencies:
+
+```yaml
+dev_dependencies:
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/app_icon.png"
+  min_sdk_android: 21
+  adaptive_icon_background: "#03045E"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+```
+
+4. Run the generator:
+
+```bash
+dart run flutter_launcher_icons
+```
+
+5. Build the APK — your icon will appear on the Android home screen.
+
+> A ready-made icon (swimmer silhouette + wave, SwimTrack brand colors) is included in this repository's `assets/icon/` folder.
+
+---
+
+## 9. Connecting Device + App
+
+### Step-by-Step
+
+1. **Flash firmware** to the ESP32 (see Section 3)
+2. **Power on** the ESP32 — LED blinks twice = self-test passed
+3. **On your Android phone:** Settings → WiFi → connect to `SwimTrack` (password: `swim1234`)
+4. **Open the SwimTrack app**
+5. **Login screen:** Device Name = `SwimTrack`, Password = `swim1234` → tap **Connect**
+6. **Settings tab:** tap **Sync Sessions** to pull any previously saved sessions
+7. **Home tab:** tap **START SESSION** → swim → tap **STOP SESSION**
+8. Session is saved locally and appears in History
+
+> The phone may occasionally drop the SwimTrack WiFi (no internet = Android deprioritises it). If the app shows "Disconnected", go to phone WiFi settings and reconnect to `SwimTrack`.
+
+### Verify the Device is Sending Real Data
+
+When connected, open a browser on the same phone and navigate to:
+
+```
+http://192.168.4.1/api/live
+```
+
+You should see a JSON response with `"session_active": false` when idle. Start a session (button short press or serial `s`) and refresh — you'll see live stroke/lap data updating. This confirms the device is sending real data, not mock data.
+
+---
+
+## 10. WiFi REST API Reference
+
+**Base URL:** `http://192.168.4.1`  
+**Auth:** None  
+**Protocol:** HTTP/1.1, JSON bodies
 
 ### GET /api/status
 
@@ -503,7 +447,11 @@ All responses: `Content-Type: application/json`
 }
 ```
 
+`mode` is either `"IDLE"` or `"RECORDING"`.
+
 ### GET /api/live
+
+Poll at 1 Hz during a session. All float fields arrive as strings (e.g. `"32.5"` not `32.5`) due to ArduinoJson serialization — the app handles both.
 
 ```json
 {
@@ -516,15 +464,15 @@ All responses: `Content-Type: application/json`
   "resting":        false,
   "lap_elapsed_s":  "8.3",
   "swolf_est":      "21.8",
-  "variance":       "0.0012",
   "session_active": true,
   "ax": "0.012", "ay": "-0.003", "az": "1.001",
-  "gx": "0.01",  "gy": "0.02",  "gz": "-0.01",
-  "temp_c": "24.5"
+  "gx": "0.01",  "gy": "0.02",   "gz": "-0.01"
 }
 ```
 
 ### GET /api/sessions
+
+Returns summary list (no lap data):
 
 ```json
 [
@@ -542,11 +490,11 @@ All responses: `Content-Type: application/json`
 
 ### GET /api/sessions/{id}
 
+Full session with lap data:
+
 ```json
 {
   "id":            12010,
-  "start_ms":      1234567890,
-  "end_ms":        1234567976,
   "duration_s":    "86.1",
   "pool_m":        25,
   "laps":          4,
@@ -565,49 +513,162 @@ All responses: `Content-Type: application/json`
 
 ### POST /api/session/start
 
-Request: `{"pool_length_m": 25}` (optional — defaults to current device setting)  
-Response: `{"ok": true, "pool_m": 25, "id": 1234567}`
+```json
+// Request
+{ "pool_length_m": 25 }
+
+// Response
+{ "ok": true, "pool_m": 25, "id": 1234567 }
+```
+
+`id` is `millis()` at start time — temporary handle. Use `saved_id` from stop response to fetch the saved session.
 
 ### POST /api/session/stop
 
-Response: `{"ok": true, "saved_id": 12010}`
+```json
+// Response
+{ "ok": true, "saved_id": 12010 }
+```
 
 ### POST /api/config
 
-Request: `{"pool_length_m": 50}`  
-Response: `{"ok": true, "pool_m": 50}`
+```json
+// Request
+{ "pool_length_m": 50 }
+
+// Response
+{ "ok": true, "pool_m": 50 }
+```
 
 ### DELETE /api/sessions/{id}
 
-Response: `{"ok": true}` or `{"error": "session not found"}`
+```json
+// Response
+{ "ok": true }
+```
 
 ---
 
-## 7. Changelog
+## 11. Known Limitations & How to Improve
 
-### Firmware — v1.0.0-dev (March 2026)
+This section is for developers who want to improve the system.
 
-First complete firmware release. All core modules implemented and confirmed on real hardware (ESP32 30-pin + MPU-6050). Power Manager (Prompt 8) deferred to ESP32-S2 hardware build. Stub battery values (100%, 4.20V) served via API.
+### 1. Stroke Classification Always Returns FREESTYLE
 
-| Version | Description |
-|---------|-------------|
-| v0.1 | Basic IMU read + Serial at 50 Hz |
-| v0.2 | EMA filter + Serial Plotter |
-| v0.3 | Stroke detection FSM + LED flash |
-| v0.4 | Lap counter + rest detection |
-| v0.5 | Session JSON → LittleFS |
-| v0.6 | WiFi SoftAP + REST endpoints |
-| v0.7 | Web dashboard |
-| v0.9 | State machine + self-test + button + sleep |
-| v1.0-dev | Full integration. All prompts complete except battery. |
+**File:** `src/stroke_detector.cpp` — `_classifyStroke()`
 
-Known issues: stroke type classification always returns FREESTYLE (gyro-based classification deferred); session ID uses `millis()` rather than a real-time clock; `LAP_MIN_DURATION_MS` must be manually changed between bench (5000) and pool (15000) testing.
+Currently returns `FREESTYLE` for all strokes. To implement real classification:
+- Collect labelled IMU data for each stroke type
+- Breaststroke has distinctive bilateral symmetry in accel Y axis
+- Backstroke shows inverted Z compared to freestyle
+- Butterfly has strong double-peak pattern per cycle
+- A simple rule-based classifier or small decision tree would work
 
-### App — v1.0.0 (March 2026)
+### 2. Battery Reading Always Returns 100%
 
-Complete Flutter companion app across 7 build stages: project foundation, login/profile, session history and detail screens, home tab with live recording, settings/device/sync, polish and error handling, and documentation. Simulator mode allows full app testing without hardware.
+**File:** `include/config.h` — `PIN_BATTERY_ADC`
+
+The ADC read is defined but not connected to a voltage divider circuit. To fix:
+- Connect a 100k+100k voltage divider from battery+ to GPIO 1
+- The existing constants `BATT_FULL_MV`, `BATT_EMPTY_MV`, `BATT_DIVIDER_RATIO` are correct
+- Uncomment/implement the ADC read in `session_manager.cpp`
+
+### 3. Session Timestamps Are Relative (Not Real Time)
+
+**Root cause:** The ESP32 has no RTC and no NTP (no internet). `millis()` gives time since boot, not Unix time.
+
+**Options to fix:**
+- Add a DS3231 RTC module connected over I2C (most reliable)
+- On WiFi connect from the phone, send current timestamp via `POST /api/config` with `{"timestamp": 1234567890}` and store it as an offset
+
+### 4. Android WiFi Switching (Android 10+)
+
+Android 10+ blocks apps from programmatically switching WiFi networks. Users must manually connect to `SwimTrack` in phone settings before using the app.
+
+**Mitigation:** The app's Login screen shows clear instructions. The `wifi_iot` plugin does its best but cannot override the OS policy.
+
+### 5. Lap Detection: LAP_MIN_DURATION_MS Needs Pool Tuning
+
+The default `5000 ms` minimum lap duration works for 25m pools but may need adjustment:
+- **Sprint lanes (15m drill laps):** Set to `3000`
+- **50m pool:** `8000` to avoid false laps mid-pool
+- **Children / slow swimmers:** `8000`+
+
+### 6. SWOLF Accuracy
+
+SWOLF = strokes + seconds per lap. Accuracy depends on:
+- Stroke threshold being set correctly for the swimmer's power
+- The device being worn firmly on the wrist (not sliding)
+- Lap detection being accurate
+
+**Verification:** After a session, compare the app's lap times with a stopwatch for a few laps. If lap times are off, tune `TURN_GYRO_Z_THRESH_DPS`.
+
+### 7. Live Data Continuity
+
+The app polls `/api/live` at 1 Hz. If the phone WiFi sleeps briefly, a poll may fail and the UI shows a momentary "---". This is cosmetic — the device keeps recording correctly.
 
 ---
 
-*SwimTrack — built with PlatformIO + Arduino (firmware) and Flutter (app).*  
-*Firmware repo: https://github.com/AbdelRahman-Madboly/SwimTrack-Firmware*
+## 12. Troubleshooting
+
+### App shows data when device is not moving
+
+**Cause:** Simulator Mode is ON.  
+**Fix:** Settings → APP section → turn Simulator Mode **OFF**, then reconnect.
+
+### All API calls fail / connection refused
+
+1. Verify your phone is connected to the `SwimTrack` WiFi network (not home/mobile)
+2. Check `AndroidManifest.xml` has `android:usesCleartextTraffic="true"` in `<application>`
+3. Try `http://192.168.4.1/api/status` in Chrome on the phone — if it loads, the firmware is fine
+
+### App shows "Disconnected" immediately after connecting
+
+Android deprioritises WiFi networks without internet. Go to phone WiFi settings, tap `SwimTrack` → "Stay connected" (or equivalent for your Android version).
+
+### WiFi permission denied
+
+Add all permissions from Section 6 to `AndroidManifest.xml`. On Android 13+, `ACCESS_FINE_LOCATION` is required for WiFi scanning.
+
+### Google Fonts not loading (blank text)
+
+The app needs internet access on first run to download Poppins/Inter. Once downloaded they are cached. Or add the fonts as local assets in `pubspec.yaml`.
+
+### sqflite crash on iOS Simulator
+
+Use a physical Android device or an Android emulator. sqflite has known issues with the iOS Simulator.
+
+### App shows no sessions after sync
+
+1. Start a session on the device (button press or serial `s`)
+2. Stop it (button press or serial `x`)
+3. Verify with `l` in serial monitor that sessions are listed
+4. In app: Settings → Sync Sessions
+
+### Firmware fails to compile
+
+- Ensure `board_build.filesystem = littlefs` is in `platformio.ini`
+- Run `pio run --target uploadfs` before `pio run --target upload` on first flash
+- If `WHO_AM_I` mismatch: check `MPU_WHO_AM_I_VAL` in `config.h` matches your hardware (0x68 for MPU-6050, 0x70 for MPU-6500)
+
+### LED shows rapid blink (fatal error)
+
+Serial monitor will show the error. Common causes:
+- IMU not found at I2C address (check wiring)
+- LittleFS mount failed (run `pio run --target uploadfs`)
+
+---
+
+## Firmware Version History
+
+See [CHANGELOG.md](CHANGELOG.md) in the firmware repo.
+
+---
+
+## License
+
+MIT — see `LICENSE` in each repository.
+
+---
+
+*SwimTrack — built for swimmers, by swimmers.*
