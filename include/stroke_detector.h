@@ -17,8 +17,17 @@
  *            - Stroke rate (spm) is derived from a circular buffer of the
  *              last STROKE_RATE_WINDOW inter-stroke intervals.
  *
+ *          v2 changes:
+ *            - update() now takes ax and gz for the real-time classifier window.
+ *            - 50-sample circular buffers (_axWindow, _gxWindow) feed the
+ *              decision-tree classifier (_classifyStroke) on every confirmed stroke.
+ *            - Decision tree (99.2% CV accuracy on dry-land data):
+ *                ax_min ≤ -0.35  → BACKSTROKE
+ *                ax_min > -0.35 AND gx_max ≤ 482.42  → FREESTYLE
+ *                ax_min > -0.35 AND gx_max >  482.42  → BACKSTROKE
+ *
  * @author  SwimTrack Firmware Team
- * @date    2025-01-01
+ * @date    2026-04
  */
 
 #pragma once
@@ -47,10 +56,6 @@
 
 /**
  * @brief Classification of swimming stroke style.
- *
- *        UNKNOWN is the default; FREESTYLE is the placeholder returned by
- *        the current _classifyStroke() stub.  Full classification will be
- *        added in a later prompt using gyro signature analysis.
  */
 enum class StrokeType : uint8_t {
     UNKNOWN      = 0,
@@ -64,7 +69,7 @@ enum class StrokeType : uint8_t {
  * @brief Return a human-readable name for a StrokeType value.
  *
  * @param t  StrokeType enum value.
- * @return const char*  e.g. "FREESTYLE", "UNKNOWN".
+ * @return const char*  e.g. "FREESTYLE", "BACKSTROKE", "UNKNOWN".
  */
 const char* strokeTypeName(StrokeType t);
 
@@ -81,9 +86,10 @@ const char* strokeTypeName(StrokeType t);
  *   det.begin();
  *
  *   // In 50 Hz sample loop:
- *   if (det.update(filtMag, millis())) {
- *       Serial.printf("Stroke #%lu at %.1f spm\n",
- *                     det.strokeCount(), det.strokeRateSpm());
+ *   if (det.update(filtMag, sample.ax, sample.gz, millis())) {
+ *       Serial.printf("Stroke #%lu at %.1f spm — %s\n",
+ *                     det.strokeCount(), det.strokeRateSpm(),
+ *                     strokeTypeName(det.strokeType()));
  *   }
  * @endcode
  */
@@ -101,7 +107,7 @@ public:
      * @brief Initialise (or re-initialise) detector state.
      *
      *        Resets stroke count, inter-stroke interval buffer, FSM state,
-     *        and seeds the baseline filter to 1.0 g.
+     *        classifier window buffers, and seeds the baseline filter to 1.0 g.
      *        Call once in setup() and again at session start.
      */
     void begin();
@@ -113,16 +119,19 @@ public:
     /**
      * @brief Feed one filtered magnitude sample into the stroke detector.
      *
-     *        Updates the dynamic baseline (BELOW state only), runs the
-     *        two-state FSM, and on a confirmed stroke: increments count,
-     *        updates the inter-stroke interval buffer, and classifies style.
+     *        Updates the dynamic baseline (BELOW state only), fills the
+     *        classifier circular buffers, runs the two-state FSM, and on a
+     *        confirmed stroke: increments count, updates the inter-stroke
+     *        interval buffer, and classifies stroke style.
      *
      * @param filtMag  Filtered accel magnitude [g] from EMAFilter.
+     * @param ax       Raw accelerometer X axis [g] — used by classifier.
+     * @param gz       Raw gyroscope Z axis [dps] — used by classifier.
      * @param nowMs    Current millis() timestamp.
      * @return true if a new stroke was detected on this sample (falling edge
      *         of the ABOVE state).
      */
-    bool update(float filtMag, uint32_t nowMs);
+    bool update(float filtMag, float ax, float gz, uint32_t nowMs);
 
     // --------------------------------------------------------
     //  Accessors
@@ -136,11 +145,6 @@ public:
 
     /**
      * @brief Return the smoothed stroke rate in strokes per minute.
-     *
-     *        Computed from the average of the last STROKE_RATE_WINDOW
-     *        inter-stroke intervals.  Returns 0.0 until at least two
-     *        strokes have been detected.
-     *
      * @return float  Stroke rate [spm].
      */
     float strokeRateSpm() const;
@@ -153,34 +157,25 @@ public:
 
     /**
      * @brief Return the classified stroke type of the most recent stroke.
-     * @return StrokeType  Always FREESTYLE in the current stub.
+     * @return StrokeType  FREESTYLE, BACKSTROKE, or UNKNOWN (if window not full).
      */
     StrokeType strokeType() const;
 
     /**
      * @brief Return the current dynamic baseline magnitude [g].
-     *
-     *        This is the slow-EMA estimate of the gravity-level at rest.
-     *        Useful for Serial Plotter / diagnostic output.
-     *
      * @return float  Baseline [g].
      */
     float baseline() const;
 
     /**
      * @brief Return the current detection threshold [g].
-     *
      *        threshold = baseline() + STROKE_THRESHOLD_G.
-     *
      * @return float  Threshold [g].
      */
     float threshold() const;
 
     /**
      * @brief Return true if the FSM is currently in the ABOVE state.
-     *
-     *        Useful for drawing a square-wave "above" trace in Serial Plotter.
-     *
      * @return bool  true while filtMag > threshold.
      */
     bool isAboveThreshold() const;
@@ -192,9 +187,9 @@ public:
     /**
      * @brief Reset stroke count and interval history; keep baseline filter.
      *
-     *        Use for mid-session resets or Serial command 'r'.
      *        The baseline filter retains its current state so the threshold
      *        remains calibrated immediately after reset.
+     *        Classifier window buffers are also reset.
      */
     void reset();
 
@@ -213,7 +208,6 @@ private:
 
     /**
      * @brief Push a new inter-stroke interval into the circular buffer.
-     *
      * @param intervalMs  Time between the two most recent strokes [ms].
      */
     void _pushInterval(uint32_t intervalMs);
@@ -225,17 +219,22 @@ private:
     void _updateRate();
 
     /**
-     * @brief Classify the stroke type from recent IMU data.
+     * @brief Classify stroke type using a decision tree trained on real data.
      *
-     *        Current implementation: always returns FREESTYLE.
-     *        Will be expanded with gyro-signature analysis in Prompt 7.
+     *        Decision tree (depth 2, 99.2% CV accuracy on dry-land data):
+     *          ax_min ≤ -0.35          → BACKSTROKE
+     *          ax_min >  -0.35 AND gx_max ≤ 482.42  → FREESTYLE
+     *          ax_min >  -0.35 AND gx_max >  482.42  → BACKSTROKE
+     *
+     *        Where ax_min / gx_max are min/max over the last CLASSIFIER_WINDOW
+     *        samples.  Returns UNKNOWN until the window is full.
      *
      * @return StrokeType  Classification result.
      */
     StrokeType _classifyStroke();
 
     // --------------------------------------------------------
-    //  State
+    //  FSM / rate state
     // --------------------------------------------------------
 
     State      _state;           ///< Current FSM state
@@ -251,4 +250,15 @@ private:
     uint32_t   _intervals[STROKE_RATE_WINDOW];
     uint8_t    _intervalHead;    ///< Next write index
     uint8_t    _intervalCount;   ///< Number of valid entries (0 … STROKE_RATE_WINDOW)
+
+    // --------------------------------------------------------
+    //  Classifier window — 50 samples = 1 s at 50 Hz
+    // --------------------------------------------------------
+
+    static constexpr uint8_t CLASSIFIER_WINDOW = 50;
+
+    float   _axWindow[CLASSIFIER_WINDOW];  ///< Circular buffer of ax values
+    float   _gxWindow[CLASSIFIER_WINDOW];  ///< Circular buffer of gz values (named gx for classifier)
+    uint8_t _classHead;                    ///< Next write index into classifier buffers
+    bool    _classWindowFull;              ///< True once the first 50 samples have been collected
 };

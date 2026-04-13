@@ -14,9 +14,12 @@
  *              the gate is checked on the BELOW → ABOVE rising edge.
  *            - Stroke rate uses the average of the last STROKE_RATE_WINDOW
  *              inter-stroke intervals stored in a circular buffer.
+ *            - Classifier window: every call to update() pushes ax and gz into
+ *              50-sample circular buffers.  _classifyStroke() uses min/max over
+ *              this window for a depth-2 decision tree (99.2% CV accuracy).
  *
  * @author  SwimTrack Firmware Team
- * @date    2025-01-01
+ * @date    2026-04
  */
 
 #include "stroke_detector.h"
@@ -58,9 +61,13 @@ StrokeDetector::StrokeDetector()
       _strokeType(StrokeType::UNKNOWN),
       _rateSpm(0.0f),
       _intervalHead(0),
-      _intervalCount(0)
+      _intervalCount(0),
+      _classHead(0),
+      _classWindowFull(false)
 {
     memset(_intervals, 0, sizeof(_intervals));
+    memset(_axWindow,  0, sizeof(_axWindow));
+    memset(_gxWindow,  0, sizeof(_gxWindow));
 }
 
 // ============================================================
@@ -72,7 +79,7 @@ StrokeDetector::StrokeDetector()
  *
  *        Seeds the baseline filter to 1.0 g (expected static value when the
  *        wrist is at rest) so the threshold is valid from the first sample.
- *        Resets all counters and the interval history.
+ *        Resets all counters, interval history, and classifier window.
  */
 void StrokeDetector::begin()
 {
@@ -85,13 +92,19 @@ void StrokeDetector::begin()
     _intervalCount = 0;
     memset(_intervals, 0, sizeof(_intervals));
 
+    // Reset classifier window
+    _classHead       = 0;
+    _classWindowFull = false;
+    memset(_axWindow, 0, sizeof(_axWindow));
+    memset(_gxWindow, 0, sizeof(_gxWindow));
+
     // Seed baseline to 1.0 g — gravity level when stationary
     _baselineFilter.reset(1.0f);
 
     DBG("STROKE", "StrokeDetector initialised. "
-                  "threshold_g=baseline+%.2f, gap_ms=%d, rate_window=%d",
+                  "threshold_g=baseline+%.4f, gap_ms=%d, rate_window=%d, classifier_window=%d",
         (float)STROKE_THRESHOLD_G, (int)STROKE_MIN_GAP_MS,
-        (int)STROKE_RATE_WINDOW);
+        (int)STROKE_RATE_WINDOW, (int)CLASSIFIER_WINDOW);
 }
 
 // ============================================================
@@ -100,6 +113,11 @@ void StrokeDetector::begin()
 
 /**
  * @brief Process one filtered magnitude sample through the stroke FSM.
+ *
+ *        Classifier buffer update:
+ *          ax and gz are pushed into their 50-sample circular buffers on
+ *          EVERY call, regardless of FSM state.  This ensures the window
+ *          always represents the most recent 1 second of motion.
  *
  *        Baseline update rule:
  *          Only advance the slow EMA while in BELOW state.  This keeps the
@@ -112,11 +130,21 @@ void StrokeDetector::begin()
  *          ABOVE → BELOW: filtMag <= threshold  → STROKE COUNTED
  *
  * @param filtMag  EMA-filtered acceleration magnitude [g].
+ * @param ax       Accelerometer X axis [g] — fed to classifier window.
+ * @param gz       Gyroscope Z axis [dps] — fed to classifier window.
  * @param nowMs    Current millis() timestamp.
  * @return true if a stroke was confirmed on this sample (falling edge).
  */
-bool StrokeDetector::update(float filtMag, uint32_t nowMs)
+bool StrokeDetector::update(float filtMag, float ax, float gz, uint32_t nowMs)
 {
+    // ---- Fill classifier window buffers (every sample, regardless of state) ----
+    _axWindow[_classHead] = ax;
+    _gxWindow[_classHead] = gz;
+    _classHead = (_classHead + 1) % CLASSIFIER_WINDOW;
+    if (!_classWindowFull && _classHead == 0) {
+        _classWindowFull = true;
+    }
+
     // ---- Update baseline only when below threshold (quiet phase) ----
     if (_state == State::BELOW) {
         _baselineFilter.update(filtMag);

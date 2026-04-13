@@ -4,19 +4,16 @@
  *
  *          Split from wifi_server.cpp to stay under 200 lines.
  *
- *          Fixes applied vs. original:
- *            - Use wifiStrokeDet() / wifiLapCtr() / wifiSessMgr() accessors
- *              instead of the private s_sd / s_lc / s_sm symbols (which are
- *              static inside wifi_server.cpp and therefore invisible here).
- *            - StaticJsonDocument<512> → JsonDocument  (ArduinoJson v7).
- *            - Removed the two orphaned anonymous blocks at the bottom of the
- *              original file (handleOptions body and handleNotFound body);
- *              those functions now live in wifi_server.cpp where they belong.
- *            - handleLive() is now a proper non-static void function so that
- *              wifi_server.cpp can forward-declare and register it.
+ *          v2 changes:
+ *            - Added real battery ADC read (PIN_BATTERY_ADC / GPIO1).
+ *              Reads analogRead(), converts to mV via voltage divider, then
+ *              maps to percentage between BATT_EMPTY_MV and BATT_FULL_MV.
+ *              Adds "batt_mv" (int) and "batt_pct" (int) to the JSON response.
+ *              The Flutter app's LiveData.fromJson() reads batt_pct for the
+ *              battery indicator in the recording view.
  *
  * @author  SwimTrack Firmware Team
- * @date    2025-01-01
+ * @date    2026-04
  */
 
 #include <WebServer.h>
@@ -54,7 +51,7 @@ static void liveJson(int code, const String& json)
  *        Reads the most recent 50 Hz IMUSample and the current stroke / lap
  *        metrics without touching the private state of wifi_server.cpp.
  *
- *        Typical polling rate from the mobile app: 1–2 Hz.
+ *        Typical polling rate from the mobile app: 1 Hz.
  */
 void handleLive()
 {
@@ -93,7 +90,7 @@ void handleLive()
         float estSwolf = (float)lapStrokeCount + lc->currentLapElapsedS();
         doc["swolf_est"] = serialized(String(estSwolf, 1));
 
-        // DPS — last completed lap and running session average
+        // DPS — last completed lap distance per stroke
         doc["lap_dps"] = serialized(String(lc->lastLap().dps_m_per_stroke, 2));
     }
 
@@ -102,6 +99,27 @@ void handleLive()
     if (sm) {
         doc["session_active"] = sm->isActive();
         doc["session_laps"]   = sm->currentLapCount();
+    }
+
+    // ── Battery voltage — read ADC, convert to mV, compute percentage ────────
+    // Hardware: 100k+100k voltage divider from LIPO+ to PIN_BATTERY_ADC (GPIO1).
+    // ESP32-S2 does not disable ADC during WiFi AP (unlike standard ESP32).
+    {
+        uint32_t rawAdc = analogRead(PIN_BATTERY_ADC);
+        float vBatt = ((float)rawAdc / (float)ADC_MAX_COUNT)
+                      * (float)ADC_VREF_MV / BATT_DIVIDER_RATIO;
+
+        uint8_t battPct = 0;
+        if      (vBatt >= (float)BATT_FULL_MV)  battPct = 100;
+        else if (vBatt <= (float)BATT_EMPTY_MV) battPct = 0;
+        else battPct = (uint8_t)(100.0f * (vBatt - (float)BATT_EMPTY_MV)
+                                         / ((float)BATT_FULL_MV - (float)BATT_EMPTY_MV));
+
+        doc["batt_mv"]  = (int)vBatt;
+        doc["batt_pct"] = battPct;
+
+        DBG("LIVE", "Battery: raw=%lu vBatt=%.0fmV pct=%u%%",
+            (unsigned long)rawAdc, vBatt, (unsigned)battPct);
     }
 
     String out;

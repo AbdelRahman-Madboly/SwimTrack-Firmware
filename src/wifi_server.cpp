@@ -231,10 +231,30 @@ static void handleStatus()
     doc["session_active"] = s_sm->isActive();
     doc["wifi_clients"]   = (int)WiFi.softAPgetStationNum();
     doc["uptime_s"]       = (millis() - s_bootMs) / 1000UL;
-    doc["battery_pct"]    = 100;     // Stub — replaced in Prompt 8
-    doc["battery_v"]      = 4.20f;  // Stub — replaced in Prompt 8
     doc["pool_m"]         = poolLengthM;
     doc["free_heap"]      = (uint32_t)ESP.getFreeHeap();
+
+    // Battery voltage — real ADC read on PIN_BATTERY_ADC (GPIO1).
+    // 100k+100k voltage divider: BATT_DIVIDER_RATIO = 0.5.
+    // ESP32-S2 does not disable ADC pins during WiFi AP mode.
+    {
+        uint32_t rawAdc = analogRead(PIN_BATTERY_ADC);
+        float vBatt = ((float)rawAdc / (float)ADC_MAX_COUNT)
+                      * (float)ADC_VREF_MV / BATT_DIVIDER_RATIO;
+
+        uint8_t bPct = 0;
+        if      (vBatt >= (float)BATT_FULL_MV)  bPct = 100;
+        else if (vBatt <= (float)BATT_EMPTY_MV) bPct = 0;
+        else bPct = (uint8_t)(100.0f * (vBatt - (float)BATT_EMPTY_MV)
+                                       / ((float)BATT_FULL_MV - (float)BATT_EMPTY_MV));
+
+        doc["battery_pct"] = bPct;
+        doc["battery_v"]   = serialized(String(vBatt / 1000.0f, 2));
+
+        DBG("STATUS", "Battery: raw=%lu vBatt=%.0fmV pct=%u%%",
+            (unsigned long)rawAdc, vBatt, (unsigned)bPct);
+    }
+
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
