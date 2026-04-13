@@ -2,21 +2,16 @@
  * @file    wifi_api.cpp
  * @brief   SwimTrack REST API — POST, DELETE, and session data handlers.
  *
- *          Continuation of wifi_server.cpp.  Split to stay under 200 lines.
- *
- *          Contains:
- *            - handleGetSessions()      GET  /api/sessions
- *            - handleGetSession()       GET  /api/sessions/<id>
- *            - handlePostSessionStart() POST /api/session/start
- *            - handlePostSessionStop()  POST /api/session/stop
- *            - handlePostConfig()       POST /api/config
- *            - handleDeleteSession()    DELETE /api/sessions/<id>
- *
- *          ArduinoJson v7: StaticJsonDocument / DynamicJsonDocument
- *          replaced throughout with JsonDocument.
+ *          v2 fix — CRITICAL:
+ *            handlePostSessionStart() now calls apiStartRecording() instead of
+ *            sessMgr->startSession() directly.  The direct call left s_state=IDLE
+ *            so the 50 Hz sample loop skipped all stroke/lap algorithms and
+ *            strokes were always 0.  apiStartRecording() / apiStopRecording()
+ *            are wrappers in main.cpp that call enterRecording() / enterIdle(),
+ *            keeping the state machine consistent whether started by button or API.
  *
  * @author  SwimTrack Firmware Team
- * @date    2025-01-01
+ * @date    2026-04
  */
 
 #include <WebServer.h>
@@ -30,15 +25,16 @@ SessionManager* wifiSessMgr();
 StrokeDetector* wifiStrokeDet();
 LapCounter*     wifiLapCtr();
 
+// State machine wrappers defined in main.cpp.
+// Must be called instead of sessMgr->start/stopSession() so that s_state
+// is updated and the 50 Hz loop activates/deactivates algorithms correctly.
+extern void apiStartRecording();
+extern void apiStopRecording();
+
 // ============================================================
 //  INTERNAL HELPERS
 // ============================================================
 
-/**
- * @brief Re-usable JSON sender with CORS headers.
- * @param code  HTTP status code.
- * @param json  Response body.
- */
 static void apiSendJson(int code, const String& json)
 {
     wifiServerRef().sendHeader("Access-Control-Allow-Origin",  "*");
@@ -46,11 +42,6 @@ static void apiSendJson(int code, const String& json)
     wifiServerRef().send(code, "application/json", json);
 }
 
-/**
- * @brief Extract the session ID from a URI like /api/sessions/12345.
- * @param uri  Full request URI string.
- * @return uint32_t  Parsed ID, or 0 on failure.
- */
 static uint32_t parseIdFromUri(const String& uri)
 {
     int slash = uri.lastIndexOf('/');
@@ -64,13 +55,6 @@ static uint32_t parseIdFromUri(const String& uri)
 //  GET /api/sessions
 // ============================================================
 
-/**
- * @brief Return a JSON array of session summaries from LittleFS.
- *
- *        Opens each .json file in /sessions and reads only the top-level
- *        scalar fields (id, duration_s, laps, total_strokes, pool_m,
- *        total_dist_m, avg_swolf) without loading per-lap arrays.
- */
 void handleGetSessions()
 {
     File dir = LittleFS.open(SESSION_DIR);
@@ -79,14 +63,13 @@ void handleGetSessions()
         return;
     }
 
-    // ArduinoJson v7: JsonDocument (replaces DynamicJsonDocument)
     JsonDocument doc;
     JsonArray    arr = doc.to<JsonArray>();
 
     File entry = dir.openNextFile();
     while (entry) {
         if (!entry.isDirectory()) {
-            JsonDocument summary;   // replaces StaticJsonDocument<512>
+            JsonDocument summary;
             if (!deserializeJson(summary, entry)) {
                 JsonObject obj        = arr.add<JsonObject>();
                 obj["id"]            = summary["id"]            | 0;
@@ -114,9 +97,6 @@ void handleGetSessions()
 //  GET /api/sessions/<id>
 // ============================================================
 
-/**
- * @brief Stream the full JSON of one session file to the HTTP client.
- */
 void handleGetSession()
 {
     uint32_t id = parseIdFromUri(wifiServerRef().uri());
@@ -142,30 +122,30 @@ void handleGetSession()
 //  POST /api/session/start
 // ============================================================
 
-/**
- * @brief Start a new session, optionally with a pool length in the body.
- *
- *        Body (optional): {"pool_length_m": 25}
- *        Resets stroke and lap counters before starting.
- */
 void handlePostSessionStart()
 {
-    uint8_t pool = poolLengthM;   // default from extern global
+    uint8_t pool = poolLengthM;
 
     if (wifiServerRef().hasArg("plain")) {
-        JsonDocument req;   // replaces StaticJsonDocument<128>
+        JsonDocument req;
         if (!deserializeJson(req, wifiServerRef().arg("plain"))) {
             if (!req["pool_length_m"].isNull()) {
                 pool = (uint8_t)(req["pool_length_m"].as<int>());
-                poolLengthM = pool;
             }
         }
     }
 
-    wifiStrokeDet()->reset();
-    wifiLapCtr()->reset();
-    lapStrokeCount = 0;
-    wifiSessMgr()->startSession(pool);
+    // Set pool length BEFORE apiStartRecording() reads poolLengthM
+    poolLengthM = pool;
+
+    // apiStartRecording() calls enterRecording() in main.cpp which:
+    //   1. Resets strokeDet, lapCtr, lapStrokeCount
+    //   2. Calls sessMgr.startSession(poolLengthM)
+    //   3. Sets s_state = RECORDING  <-- activates 50 Hz algorithms
+    apiStartRecording();
+
+    DBG("WIFI", "Session started via API | pool=%d m | active=%d",
+        pool, (int)wifiSessMgr()->isActive());
 
     String resp = "{\"ok\":true,\"pool_m\":";
     resp += pool;
@@ -179,9 +159,6 @@ void handlePostSessionStart()
 //  POST /api/session/stop
 // ============================================================
 
-/**
- * @brief Stop the active session and save to LittleFS.
- */
 void handlePostSessionStop()
 {
     if (!wifiSessMgr()->isActive()) {
@@ -189,9 +166,13 @@ void handlePostSessionStop()
         return;
     }
 
-    uint32_t totalStrokes = wifiStrokeDet()
-                            ? wifiStrokeDet()->strokeCount() : 0;
-    wifiSessMgr()->stopSession(totalStrokes);
+    // apiStopRecording() calls enterIdle() in main.cpp which:
+    //   1. Calls sessMgr.stopSession(strokeDet.strokeCount())
+    //   2. Sets s_state = IDLE
+    apiStopRecording();
+
+    DBG("WIFI", "Session stopped via API | saved_id=%lu",
+        (unsigned long)wifiSessMgr()->lastSavedId());
 
     String resp = "{\"ok\":true,\"saved_id\":";
     resp += wifiSessMgr()->lastSavedId();
@@ -203,15 +184,10 @@ void handlePostSessionStop()
 //  POST /api/config
 // ============================================================
 
-/**
- * @brief Update runtime config values.
- *
- *        Supported keys: pool_length_m
- */
 void handlePostConfig()
 {
     if (wifiServerRef().hasArg("plain")) {
-        JsonDocument req;   // replaces StaticJsonDocument<256>
+        JsonDocument req;
         if (!deserializeJson(req, wifiServerRef().arg("plain"))) {
             if (!req["pool_length_m"].isNull()) {
                 poolLengthM = (uint8_t)(req["pool_length_m"].as<int>());
@@ -230,9 +206,6 @@ void handlePostConfig()
 //  DELETE /api/sessions/<id>
 // ============================================================
 
-/**
- * @brief Delete one session file from LittleFS.
- */
 void handleDeleteSession()
 {
     uint32_t id = parseIdFromUri(wifiServerRef().uri());

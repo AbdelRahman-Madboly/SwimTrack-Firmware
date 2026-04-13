@@ -5,11 +5,16 @@
  *  States:  IDLE | RECORDING | SLEEPING
  *  Button:  Short press = start/stop  |  Long press 3 s = full reset
  *  Sleep:   Auto deep-sleep after 5 min idle with no WiFi client
- *  Boot:    Self-test prints on every power-on
  *
- *  v2 changes:
- *    - strokeDet.update() now passes lastSample.ax and lastSample.gz
- *      to populate the classifier window for real stroke type detection.
+ *  v2 fixes:
+ *    1. Added apiStartRecording() / apiStopRecording() — public wrappers called
+ *       by wifi_api.cpp when the app starts/stops via REST.  Previously the API
+ *       called sessMgr.startSession() directly, leaving s_state=IDLE so the 50 Hz
+ *       loop never ran stroke/lap detection (strokes always 0 in log).
+ *    2. analogSetWidth(12) called in setup() — the ESP32-S2 Arduino core may
+ *       default to 13-bit mode (max 8191) causing the battery formula to return
+ *       13202 mV.  Forcing 12-bit keeps ADC_MAX_COUNT=4095 correct.
+ *    3. strokeDet.update() passes lastSample.ax and lastSample.gz for classifier.
  *
  * @author  SwimTrack Firmware Team
  * @date    2026-04
@@ -39,7 +44,7 @@
 
 #define BTN_DEBOUNCE_MS    50UL
 #define BTN_LONG_PRESS_MS  3000UL
-#define SLEEP_WAKEUP_PIN   GPIO_NUM_0   ///< BOOT button wakes from deep sleep
+#define SLEEP_WAKEUP_PIN   GPIO_NUM_0
 
 // ============================================================
 //  DEVICE STATE MACHINE
@@ -84,13 +89,11 @@ uint32_t restStartMs    = 0;
 static uint32_t s_nextSampleMs   = 0;
 static uint32_t s_sampleCount    = 0;
 static uint32_t s_rateWindowMs   = 0;
-static uint32_t s_lastImuPrintMs = 0;
-static uint32_t s_lastClientMs   = 0;   ///< Last time a WiFi client was seen
-static uint32_t s_btnPressMs     = 0;   ///< millis() when button went LOW
+static uint32_t s_lastClientMs   = 0;
+static uint32_t s_btnPressMs     = 0;
 static bool     s_btnWasPressed  = false;
 
 static const uint32_t RATE_CHECK_MS = 5000UL;
-static const uint32_t IMU_PRINT_MS  = 10000UL;
 
 // ============================================================
 //  LED HELPERS
@@ -115,10 +118,6 @@ static void ledBlink(uint8_t count, uint32_t onMs, uint32_t offMs)
 //  SELF-TEST
 // ============================================================
 
-/**
- * @brief Run startup self-test: IMU + LittleFS + print version.
- *        Halts with rapid LED blink on failure.
- */
 static void selfTest()
 {
     Serial.println();
@@ -131,7 +130,6 @@ static void selfTest()
 
     bool pass = true;
 
-    // 1. IMU
     Serial.print("[SELF-TEST] IMU ... ");
     if (imu.begin()) {
         Serial.printf("PASS (WHO_AM_I=0x%02X)\n", imu.whoAmI());
@@ -140,7 +138,6 @@ static void selfTest()
         pass = false;
     }
 
-    // 2. LittleFS (via SessionManager)
     Serial.print("[SELF-TEST] LittleFS ... ");
     if (sessMgr.begin()) {
         Serial.println("PASS");
@@ -150,7 +147,7 @@ static void selfTest()
     }
 
     if (pass) {
-        Serial.println("[SELF-TEST] ALL PASS ✓");
+        Serial.println("[SELF-TEST] ALL PASS v");
         ledBlink(2, 300, 300);
     } else {
         Serial.println("[SELF-TEST] FAILED — halting");
@@ -159,12 +156,9 @@ static void selfTest()
 }
 
 // ============================================================
-//  STATE TRANSITIONS
+//  STATE TRANSITIONS  (called by button handler AND API wrappers)
 // ============================================================
 
-/**
- * @brief Enter RECORDING state — reset counters, start session.
- */
 static void enterRecording()
 {
     if (s_state == DeviceState::RECORDING) return;
@@ -179,34 +173,26 @@ static void enterRecording()
     s_state = DeviceState::RECORDING;
 
     ledBlink(3, 80, 80);
-    Serial.printf("[STATE] → RECORDING (pool=%dm)\n", poolLengthM);
+    DBG("STATE", "-> RECORDING (pool=%d m)", poolLengthM);
+    Serial.printf("[STATE] -> RECORDING (pool=%dm)\n", poolLengthM);
 }
 
-/**
- * @brief Enter IDLE state — stop and save session if active.
- */
 static void enterIdle()
 {
     if (s_state == DeviceState::RECORDING && sessMgr.isActive()) {
         sessMgr.stopSession(strokeDet.strokeCount());
     }
-
     s_state        = DeviceState::IDLE;
     s_lastClientMs = millis();
 
     ledBlink(1, 500, 0);
-    Serial.println("[STATE] → IDLE");
+    DBG("STATE", "-> IDLE");
+    Serial.println("[STATE] -> IDLE");
 }
 
-/**
- * @brief Enter deep sleep — configure GPIO wakeup then sleep.
- *        Button (GPIO0, active LOW) wakes the device.
- *        Auto-saves if a session is still open.
- */
 static void enterSleep()
 {
-    Serial.println("[STATE] → SLEEPING");
-    Serial.println("[STATE] Press BOOT button to wake.");
+    Serial.println("[STATE] -> SLEEPING. Press BOOT to wake.");
     Serial.flush();
 
     if (sessMgr.isActive()) {
@@ -214,42 +200,43 @@ static void enterSleep()
     }
 
     ledBlink(5, 50, 50);
-
     WiFi.mode(WIFI_OFF);
     delay(100);
-
-    esp_sleep_enable_ext0_wakeup(SLEEP_WAKEUP_PIN, 0);  // LOW = wakeup
+    esp_sleep_enable_ext0_wakeup(SLEEP_WAKEUP_PIN, 0);
     esp_deep_sleep_start();
-    // Does not return
 }
+
+// ============================================================
+//  API WRAPPERS  (called by wifi_api.cpp via extern)
+//
+//  These bridge the REST API to the state machine so that
+//  starting/stopping via the app sets s_state correctly.
+//  Without these, the 50 Hz loop sees IDLE and skips all
+//  stroke/lap detection — strokes count stays 0.
+// ============================================================
+
+void apiStartRecording() { enterRecording(); }
+void apiStopRecording()  { enterIdle();      }
 
 // ============================================================
 //  BUTTON HANDLER
 // ============================================================
 
-/**
- * @brief Non-blocking button state machine (call every loop iteration).
- *        Short press  → toggle IDLE ↔ RECORDING.
- *        Long press 3s → full reset + force IDLE.
- */
 static void handleButton()
 {
     static bool lastState = HIGH;
     bool cur = digitalRead(PIN_BUTTON);
 
-    // Falling edge — button pressed
     if (lastState == HIGH && cur == LOW) {
         s_btnPressMs    = millis();
         s_btnWasPressed = true;
     }
 
-    // Rising edge — button released
     if (lastState == LOW && cur == HIGH && s_btnWasPressed) {
         s_btnWasPressed = false;
         const uint32_t held = millis() - s_btnPressMs;
 
         if (held >= BTN_LONG_PRESS_MS) {
-            // Long press — full reset
             if (sessMgr.isActive()) sessMgr.stopSession(strokeDet.strokeCount());
             strokeDet.reset();
             lapCtr.reset();
@@ -259,12 +246,8 @@ static void handleButton()
             Serial.println("[BTN] Long press — full reset");
             ledBlink(5, 100, 50);
         } else if (held >= BTN_DEBOUNCE_MS) {
-            // Short press — toggle
-            if (s_state == DeviceState::IDLE) {
-                enterRecording();
-            } else if (s_state == DeviceState::RECORDING) {
-                enterIdle();
-            }
+            if (s_state == DeviceState::IDLE)      enterRecording();
+            else if (s_state == DeviceState::RECORDING) enterIdle();
         }
     }
 
@@ -275,10 +258,6 @@ static void handleButton()
 //  SERIAL COMMANDS
 // ============================================================
 
-/**
- * @brief Dispatch one Serial command byte.
- *        s=start  x=stop  l=list  p=print  d=delete  r=reset  f=fs  i=stats
- */
 static void handleSerial()
 {
     if (!Serial.available()) return;
@@ -286,9 +265,7 @@ static void handleSerial()
 
     switch (cmd) {
         case 's': enterRecording(); break;
-
-        case 'x': enterIdle(); break;
-
+        case 'x': enterIdle();      break;
         case 'l': sessMgr.listSessions(); break;
 
         case 'p':
@@ -302,10 +279,8 @@ static void handleSerial()
             break;
 
         case 'r':
-            strokeDet.reset();
-            lapCtr.reset();
-            lapStrokeCount = 0;
-            restStartMs    = 0;
+            strokeDet.reset(); lapCtr.reset();
+            lapStrokeCount = 0; restStartMs = 0;
             Serial.println("[CMD] Counters reset.");
             break;
 
@@ -343,38 +318,38 @@ static void handleSerial()
 void setup()
 {
     Serial.begin(115200);
-    delay(300);   // USB CDC enumerate on S2 Mini
+    delay(300);
 
     pinMode(PIN_LED,    OUTPUT);
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     digitalWrite(PIN_LED, LOW);
 
-    // Check wakeup reason
+    // Force 12-bit ADC resolution (0–4095).
+    // The ESP32-S2 Arduino core may default to 13-bit (0–8191),
+    // which causes the battery formula to read ~13 V instead of ~4 V.
+    analogSetWidth(12);
+
     esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
     if (wakeup == ESP_SLEEP_WAKEUP_EXT0) {
         Serial.println("[MAIN] Woke from deep sleep via button.");
     }
 
-    selfTest();   // halts on failure
+    selfTest();
 
-    // Seed filter + init detectors
     magFilter.reset(1.0f);
     strokeDet.begin();
     lapCtr.begin();
 
-    // Start WiFi AP + REST API
     wifiBegin(&sessMgr, &strokeDet, &lapCtr, &lastSample);
 
     Serial.printf("[MAIN] Ready. State=%s  Pool=%dm\n",
                   stateName(s_state), poolLengthM);
-    Serial.println("[MAIN] Short press BOOT button to start/stop session.");
-    Serial.println("[MAIN] Long press  BOOT button (3s) to reset counters.");
+    Serial.println("[MAIN] Short press BOOT = start/stop | Long press 3s = reset");
 
     const uint32_t now = millis();
-    s_nextSampleMs   = now;
-    s_rateWindowMs   = now;
-    s_lastImuPrintMs = now;
-    s_lastClientMs   = now;
+    s_nextSampleMs  = now;
+    s_rateWindowMs  = now;
+    s_lastClientMs  = now;
 }
 
 // ============================================================
@@ -385,46 +360,34 @@ void loop()
 {
     const uint32_t now = millis();
 
-    // Service WiFi + Serial + Button (every iteration)
     wifiLoop();
     handleSerial();
     handleButton();
 
-    // Track WiFi clients for sleep timeout
     if (WiFi.softAPgetStationNum() > 0) {
         s_lastClientMs = now;
     }
 
-    // Sleep timeout — IDLE only, no active session, no recent client
     if (s_state == DeviceState::IDLE &&
         !sessMgr.isActive() &&
         (now - s_lastClientMs) >= SLEEP_TIMEOUT_MS) {
-        enterSleep();   // does not return
+        enterSleep();
     }
 
     // ---- 50 Hz IMU sample gate ----------------------------------------
     if (now >= s_nextSampleMs) {
         s_nextSampleMs += SAMPLE_PERIOD_MS;
-
-        // Guard against large timer drift on startup
-        if (now > s_nextSampleMs + SAMPLE_PERIOD_MS) {
+        if (now > s_nextSampleMs + SAMPLE_PERIOD_MS)
             s_nextSampleMs = now + SAMPLE_PERIOD_MS;
-        }
 
         if (imu.read(lastSample)) {
             s_sampleCount++;
+            const float filtMag = magFilter.update(accelMagnitude(lastSample));
 
-            const float filtMag = magFilter.update(
-                accelMagnitude(lastSample));
-
-            // ---- Run detection algorithms only when RECORDING ----------
             if (s_state == DeviceState::RECORDING) {
 
                 // Stroke detection — pass ax and gz for classifier window
-                if (strokeDet.update(filtMag,
-                                     lastSample.ax,
-                                     lastSample.gz,
-                                     now)) {
+                if (strokeDet.update(filtMag, lastSample.ax, lastSample.gz, now)) {
                     lapStrokeCount++;
                     Serial.printf(
                         "[STROKE] #%lu | Lap:%u | %.1fspm | %s\n",
@@ -438,19 +401,13 @@ void loop()
                 if (lapCtr.update(lastSample.gz, filtMag,
                                   lapStrokeCount,
                                   strokeDet.strokeRateSpm(), now)) {
-                    // Lap confirmed
                     const LapRecord& lr = lapCtr.lastLap();
                     sessMgr.recordLap(lr);
-
                     Serial.printf(
-                        "[LAP] #%u | strokes=%lu | t=%.1fs | swolf=%.1f"
-                        " | dps=%.2f\n",
+                        "[LAP] #%u | strokes=%lu | t=%.1fs | swolf=%.1f | dps=%.2f\n",
                         lr.lap_number,
                         (unsigned long)lr.stroke_count,
-                        lr.duration_s,
-                        lr.swolf,
-                        lr.dps_m_per_stroke);
-
+                        lr.duration_s, lr.swolf, lr.dps_m_per_stroke);
                     lapStrokeCount = 0;
                 }
 
@@ -458,16 +415,15 @@ void loop()
                 bool resting = lapCtr.isResting();
                 if (resting && restStartMs == 0) {
                     restStartMs = now;
-                    DBG("REST", "Rest started at %lu ms", (unsigned long)now);
                 } else if (!resting && restStartMs > 0) {
                     float restDurS = (float)(now - restStartMs) / 1000.0f;
                     sessMgr.recordRest(restStartMs, restDurS);
                     restStartMs = 0;
-                    DBG("REST", "Rest ended, duration=%.1f s", restDurS);
+                    DBG("REST", "Ended, duration=%.1f s", restDurS);
                 }
 
             } else {
-                // IDLE — still call lapCtr.update() so /api/live has variance
+                // IDLE — still run lapCtr for /api/live variance
                 lapCtr.update(lastSample.gz, filtMag, 0, 0.0f, now);
             }
 
@@ -476,13 +432,12 @@ void loop()
         }
     }
 
-    // ---- 5 s rate and diagnostics check --------------------------------
+    // ---- Rate diagnostic every 5 s ------------------------------------
     if (now - s_rateWindowMs >= RATE_CHECK_MS) {
         const float elapsed = (float)(now - s_rateWindowMs) / 1000.0f;
         const float hz      = (float)s_sampleCount / elapsed;
         DBG("MAIN", "Sample rate: %.1f Hz | state=%s | strokes=%lu",
-            hz, stateName(s_state),
-            (unsigned long)strokeDet.strokeCount());
+            hz, stateName(s_state), (unsigned long)strokeDet.strokeCount());
         s_sampleCount  = 0;
         s_rateWindowMs = now;
     }
