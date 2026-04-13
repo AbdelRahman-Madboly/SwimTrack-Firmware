@@ -327,7 +327,7 @@ void setup()
     // Force 12-bit ADC resolution (0–4095).
     // The ESP32-S2 Arduino core may default to 13-bit (0–8191),
     // which causes the battery formula to read ~13 V instead of ~4 V.
-    analogSetWidth(12);
+    analogReadResolution(12);
 
     esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
     if (wakeup == ESP_SLEEP_WAKEUP_EXT0) {
